@@ -1,5 +1,5 @@
 import math
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Dict, Optional, Any
 from collections import deque
 
 
@@ -26,6 +26,12 @@ class VehicleSpeedEstimator:
         self.H = homography_matrix
         # Map tracking ID -> deque of previous centroids
         self.tracks: Dict[int, deque] = {}
+        # Monitored spatial speed zones
+        self.zones: Dict[str, Dict[str, Any]] = {}
+        # Logged speeding violations
+        self.violations: List[Dict[str, Any]] = []
+        # Aggregate speed samples for traffic flow analytics
+        self.all_recorded_speeds: List[float] = []
 
     def _project_point(self, pt: Tuple[int, int]) -> Tuple[float, float]:
         """Projects a 2D image point onto the flat road plane using the homography matrix."""
@@ -104,6 +110,7 @@ class VehicleSpeedEstimator:
         if not hasattr(self, "_last_speeds"):
             self._last_speeds = {}
         self._last_speeds[track_id] = meters_per_sec
+        self.all_recorded_speeds.append(kmh)
 
         return {
             "kmh": round(kmh, 2),
@@ -120,6 +127,117 @@ class VehicleSpeedEstimator:
         if last_speed_mps is None:
             return False
         return (last_speed_mps * 3.6) > speed_limit_kmh
+
+    def define_speed_zone(
+        self,
+        zone_id: str,
+        polygon_bounds: List[Tuple[int, int]],
+        speed_limit_kmh: float,
+        description: str = ""
+    ) -> None:
+        """
+        Defines a spatial polygon speed enforcement zone.
+        
+        Args:
+            zone_id (str): Unique zone identifier (e.g. 'school_zone_1', 'highway_fast_lane').
+            polygon_bounds (List[Tuple[int, int]]): Vertices defining the convex/concave zone polygon in pixel coordinates.
+            speed_limit_kmh (float): Posted legal speed limit within this polygon.
+            description (str): Human-readable zone description.
+        """
+        self.zones[zone_id] = {
+            "polygon": polygon_bounds,
+            "speed_limit_kmh": speed_limit_kmh,
+            "description": description
+        }
+
+    def _point_in_polygon(self, pt: Tuple[int, int], polygon: List[Tuple[int, int]]) -> bool:
+        """
+        Standard ray casting algorithm to determine if a 2D centroid lies inside polygon boundaries.
+        """
+        x, y = pt
+        n = len(polygon)
+        if n < 3:
+            return False
+        inside = False
+        p1x, p1y = polygon[0]
+        for i in range(1, n + 1):
+            p2x, p2y = polygon[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            x_inters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= x_inters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
+
+    def check_zone_violation(
+        self,
+        track_id: int,
+        centroid: Tuple[int, int]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Checks whether a vehicle centroid is within any defined speed zone and violating that zone's limit.
+        """
+        last_speed_mps = getattr(self, "_last_speeds", {}).get(track_id)
+        if last_speed_mps is None:
+            return None
+
+        current_kmh = last_speed_mps * 3.6
+
+        for zone_id, zone_data in self.zones.items():
+            if self._point_in_polygon(centroid, zone_data["polygon"]):
+                limit = zone_data["speed_limit_kmh"]
+                if current_kmh > limit:
+                    delta = current_kmh - limit
+                    violation = {
+                        "track_id": track_id,
+                        "zone_id": zone_id,
+                        "speed_kmh": round(current_kmh, 2),
+                        "speed_limit_kmh": round(limit, 2),
+                        "excess_kmh": round(delta, 2),
+                        "severity": "CRITICAL" if delta >= 30.0 else ("MODERATE" if delta >= 15.0 else "MINOR")
+                    }
+                    self.violations.append(violation)
+                    return violation
+        return None
+
+    def get_traffic_flow_analytics(self, reference_speed_limit_kmh: float = 60.0) -> Dict[str, Any]:
+        """
+        Computes aggregate traffic engineering statistics:
+        - Mean, median, and 85th-percentile velocity
+        - Speeding compliance rate (% vehicles under posted speed limit)
+        - Total violation incidents and peak recorded speed
+        """
+        if not self.all_recorded_speeds:
+            return {
+                "total_speed_samples": 0,
+                "mean_speed_kmh": 0.0,
+                "speed_85th_percentile_kmh": 0.0,
+                "peak_speed_kmh": 0.0,
+                "compliance_rate_pct": 100.0,
+                "total_violations_logged": len(self.violations)
+            }
+
+        sorted_speeds = sorted(self.all_recorded_speeds)
+        n = len(sorted_speeds)
+        mean_speed = sum(sorted_speeds) / n
+        idx_85 = min(int(math.ceil(0.85 * n)) - 1, n - 1)
+        speed_85th = sorted_speeds[max(0, idx_85)]
+        peak_speed = sorted_speeds[-1]
+
+        compliant_count = sum(1 for s in sorted_speeds if s <= reference_speed_limit_kmh)
+        compliance_rate = (compliant_count / n) * 100.0
+
+        return {
+            "total_speed_samples": n,
+            "mean_speed_kmh": round(mean_speed, 2),
+            "speed_85th_percentile_kmh": round(speed_85th, 2),
+            "peak_speed_kmh": round(peak_speed, 2),
+            "compliance_rate_pct": round(compliance_rate, 2),
+            "total_violations_logged": len(self.violations)
+        }
 
     def purge_track(self, track_id: int) -> None:
         """Removes track history when a vehicle exits the frame."""
